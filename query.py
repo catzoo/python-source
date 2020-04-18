@@ -3,6 +3,8 @@ import struct
 import socket
 import time
 
+"""Constant values from https://developer.valvesoftware.com/wiki/Server_queries"""
+
 PACKET_SIZE = 1400
 WHOLE = -1
 SPLIT = -2
@@ -12,10 +14,17 @@ A2S_INFO_PAYLOAD = "Source Engine Query"
 
 A2S_RULES_HEADER = ord('V')
 
-REQUEST_CHALLENGE_NUMBER = -1
+A2S_PLAYERS_HEADER = ord('U')
+
+CHALLENGE_NUMBER_REQUEST = -1
+CHALLENGE_NUMBER_HEADER = ord('A')
 
 
 class QueryError(Exception):
+    pass
+
+
+class ChallengeError(Exception):
     pass
 
 
@@ -81,23 +90,31 @@ class Query:
         self.timeout = timeout
 
         self.connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.connection.settimeout(timeout)
+        self.connection.settimeout(self.timeout)
 
-    def receive(self):
+    def receive(self, send_time=False):
         """
         Receives the packet that comes in.
         This is separated because of split packets.
 
         This will automatically handle and combine split packets.
         This will also return the whole packet (including the header / split))
+
+        This can also return the time after receiving the first packet. Useful for pings
+        (used in self.send())
         """
         data = self.connection.recv(PACKET_SIZE)
+        ping = time.time()
+
         data = SourcePacket(data)
 
         header = data.get_long()
         if header == WHOLE:
             data.seek(0, 0)
-            return data
+            if send_time:
+                return data, ping
+            else:
+                return data
         else:
             packets = {}  # all the split packets received
             data.seek(0, 0)  # going back to the beginning of the packet
@@ -107,56 +124,94 @@ class Query:
             while True:
                 header = data.get_long()
                 packet_id = data.get_long()
+
                 if packet_id != old_packet_id and old_packet_id is not None:
                     raise QueryError(f'Received a different split packet with the ID {packet_id}'
                                      f' expected {old_packet_id}')
+
                 total = data.get_byte()
                 number = data.get_byte()
                 size = data.get_short()
                 packets[number] = data.read()
+
                 # making sure we're not at the end
                 if len(packets) > total - 1:
                     break
+
                 # Receiving another packet
                 data = SourcePacket(self.connection.recv(PACKET_SIZE))
 
             # combining the packets, making sure they're in order
-            packet = b""
-            for x in range(len(packets)):
-                packet += packets[x]
+            try:
+                packet = b""
+                for x in range(len(packets)):
+                    packet += packets[x]
+            except KeyError:
+                raise QueryError('Missing a split packet')
 
-            return SourcePacket(packet)
+            if send_time:
+                return SourcePacket(packet), ping
+            else:
+                return SourcePacket(packet)
 
-    def challenge_receive(self, header):
+    def send(self, header, payload=None, ping=False):
         """
-        Sends a challenge request and grabs the information with the challenge number
-        It'll send the request with the challenge number and returns the packet that was received
+        This is used to send requests to servers
+        Reason why this is in a separate method is because it was repeated a lot.
+
+        This also can return the time it took to send / receive. (Useful for pings)
         """
-        # sending challenge request
         packet = SourcePacket()
         packet.write_long(WHOLE)
         packet.write_byte(header)
-        packet.write_long(REQUEST_CHALLENGE_NUMBER)
+        if payload:
+            if isinstance(payload, str):
+                # used by A2S_INFO
+                packet.write_string(payload)
+            elif isinstance(payload, int):
+                # used by challenge
+                packet.write_long(payload)
+
         self.connection.sendto(packet.getvalue(), self.address)
 
-        # receiving challenge number
-        packet = self.receive()
-        rec_split = packet.get_long()
-        rec_header = packet.get_byte()
-        if rec_header == "E":
-            # if the server isn't sending us the number
-            packet.seek(0, 0)  # setting the position back to the beginning
+        past = time.time()
+        packet, now = self.receive(send_time=True)
+        timing = now - past
+
+        if ping:
+            return packet, timing
+        else:
             return packet
 
-        # sending request with the challenge number
-        challenge = packet.get_long()
-        packet = SourcePacket()
-        packet.write_long(WHOLE)
-        packet.write_byte(header)
-        packet.write_long(challenge)
-        self.connection.sendto(packet.getvalue(), self.address)
+    def receive_challenge(self, header):
+        """
+        This will send a challenge request and grab the challenge number.
+        Then it will send another request with the challenge number to get the packet.
 
-        return self.receive()  # returning the packet received by the server
+        This is mostly used by A2S_PLAYERS and A2S_RULES
+        """
+        # grabbing the challenge number
+        packet = self.send(header, CHALLENGE_NUMBER_REQUEST)
+        packet.get_long()  # split
+
+        rec_header = packet.get_byte()
+        if chr(rec_header) == 'E':
+            # server didn't send a challenge number, but sent the packet we're looking for
+            # basically, the server sent the rules or players packet rather than the challenge number
+            packet.seek(0, 0)
+            return packet
+
+        # requesting with the challenge
+        challenge = packet.get_long()
+        packet = self.send(header, challenge)
+
+        packet.get_long()  # split
+        rec_header = packet.get_byte()
+        if rec_header == CHALLENGE_NUMBER_HEADER:
+            raise ChallengeError(f'Sent {challenge} and got back challenge number')
+
+        packet.seek(0, 0)
+        return packet
 
     def info(self):
         """
@@ -174,14 +229,10 @@ class Query:
         Note: This method does change the values a tiny bit.
             - For example, if you got server_type = 'd'. This method will set this to "Dedicated Server"
         """
-        packet = SourcePacket()
-        packet.write_long(WHOLE)
-        packet.write_byte(A2S_INFO_HEADER)
-        packet.write_string(A2S_INFO_PAYLOAD)
-
-        self.connection.sendto(packet.getvalue(), self.address)
-        packet = self.receive()
+        packet, ping = self.send(A2S_INFO_HEADER, A2S_INFO_PAYLOAD, True)
         data = {
+            'ping': ping,
+            'raw': packet.getvalue(),
             'split': packet.get_long(),
             'header': chr(packet.get_byte()),
             'protocol': packet.get_byte(),
@@ -253,17 +304,82 @@ class Query:
         return data
 
     def rules(self):
-        packet = self.challenge_receive(A2S_RULES_HEADER)
+        """
+        This will send a A2S_RULES request to the server using receive_challenge.
+        This will return for every rule:
+            { "name": "value" }
 
-        split = packet.get_long()
-        header = packet.get_byte()
+        NOTE: Some servers may return part of a packet.
+        When this happens, one of the rules may be either:
+            - cut off
+            - not exist
+
+        This is determined by the string is not complete (does not end with 0x00)
+
+        For more information go here:
+            https://developer.valvesoftware.com/wiki/Server_queries
+        """
+        packet = self.receive_challenge(A2S_RULES_HEADER)
+
+        packet.get_long()  # split
+        packet.get_byte()  # header
         total_rules = packet.get_short()
 
         rules = {}
         for _ in range(total_rules):
-            name = packet.get_string()
-            value = packet.get_string()
-
-            rules[name] = value
+            # sometimes the packet is cut off. So we will do some try statements
+            # if the header is cut off, we'll ignore it
+            # if the value is cut off, we'll put in the header and error message
+            try:
+                name = packet.get_string()
+            except ValueError:
+                pass
+            else:
+                try:
+                    value = packet.get_string()
+                except ValueError:
+                    value = "N/A - packet cut off"
+                rules[name] = value
 
         return rules
+
+    def players(self):
+        """
+        This will send a A2S_PLAYERS request to the server using receive_challenge.
+        This will return for each player:
+            [ { 'index', 'name', 'score', 'duration' } ]
+
+        NOTE: Sometimes the server may not send all the players and packet cut off.
+        If the packet is cut off, the player information may not be here.
+
+        When this happens there will only be a number in the list.
+        For example:
+            [ {'index': 0, 'name': 'testing', 'score': 0, 'duration': 2.0},
+              36,
+              37,
+              38
+            ]
+
+        For more information about these values go here:
+            https://developer.valvesoftware.com/wiki/Server_queries
+        """
+        packet = self.receive_challenge(A2S_PLAYERS_HEADER)
+        packet.get_long()  # split
+        packet.get_byte()  # header
+
+        number_of_players = packet.get_byte()
+        players = list(range(number_of_players))
+        for x in range(number_of_players):
+            try:
+                players[x] = {
+                    'index': packet.get_byte(),
+                    'name': packet.get_string(),
+                    'score': packet.get_long(),
+                    'duration': packet.get_float()
+                }
+            except (ValueError, struct.error):
+                #  sometimes we don't get the whole packet
+                pass
+
+        return players
+
