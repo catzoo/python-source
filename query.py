@@ -1,3 +1,9 @@
+"""
+Made by catzoo
+
+This is a query rewrite of https://github.com/serverstf/python-valve
+"""
+
 from io import BytesIO
 import struct
 import socket
@@ -382,4 +388,3 @@ class Query:
                 pass
 
         return players
-
